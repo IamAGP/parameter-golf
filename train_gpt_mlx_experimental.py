@@ -42,8 +42,8 @@ COMPUTE_DTYPE = mx.bfloat16
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 class Hyperparameters:
     # Data / tokenizer.
-    data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
+    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_pure_byte_260.json")
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
@@ -55,7 +55,7 @@ class Hyperparameters:
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
-    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
+    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 2048)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
@@ -68,7 +68,7 @@ class Hyperparameters:
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # Model (defaults match the current baseline setup).
-    vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size: int = int(os.environ.get("VOCAB_SIZE", 260))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
@@ -689,6 +689,18 @@ def build_sentencepiece_luts(
     return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
 
 
+def build_pure_byte_luts(vocab_size: int, byte_offset: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # For pure byte tokenizer: token IDs 0-3 are special (0 bytes), IDs 4-259 are raw bytes (1 byte each).
+    # No leading-space concept — every token is exactly one byte.
+    # BPB = (val_loss / ln(2)) * (tokens / bytes) ≈ val_loss / ln(2) since tokens ≈ bytes.
+    base_bytes_lut = np.zeros(vocab_size, dtype=np.int16)
+    base_bytes_lut[byte_offset:] = 1
+    has_leading_space_lut = np.zeros(vocab_size, dtype=np.bool_)
+    is_boundary_token_lut = np.ones(vocab_size, dtype=np.bool_)
+    is_boundary_token_lut[byte_offset:] = False
+    return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
+
+
 def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
     # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
     # decode bytes with the exact tokenizer that produced the shards. The manifest
@@ -858,22 +870,36 @@ def main() -> None:
 
     if not args.tie_embeddings:
         raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+
+    is_byte_tokenizer = args.tokenizer_path.endswith(".json")
+    if is_byte_tokenizer:
+        # Pure byte tokenizer — load JSON config, build LUTs directly, no SentencePiece needed.
+        tok_config = json.loads(Path(args.tokenizer_path).read_text(encoding="utf-8"))
+        byte_offset = tok_config.get("config", {}).get("byte_offset", 4)
+        tok_vocab_size = int(tok_config.get("vocab_size", args.vocab_size))
+        if tok_vocab_size != args.vocab_size:
+            raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={tok_vocab_size}")
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_pure_byte_luts(
+            args.vocab_size, byte_offset=byte_offset
         )
+        log(f"tokenizer:pure_byte vocab_size:{args.vocab_size} byte_offset:{byte_offset}")
+    else:
+        if not args.tokenizer_path.endswith(".model"):
+            raise ValueError(f"TOKENIZER_PATH must be a .model (SentencePiece) or .json (pure byte) file")
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        if int(sp.vocab_size()) != args.vocab_size:
+            raise ValueError(
+                f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            )
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size
+        )
+
     dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
         args.data_path,
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size
-    )
 
     # ==============================================================================
     # TRAINING SETUP
